@@ -3,6 +3,9 @@ import logging
 import asyncio
 import sqlite3
 import re
+import uuid
+from threading import Thread
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -13,6 +16,18 @@ from telegram.ext import (
     filters
 )
 import yt_dlp
+
+# ================= WEB SERVER FOR RENDER (KEEP-ALIVE) =================
+app_web = Flask(__name__)
+
+@app_web.route('/')
+def home():
+    return "Bot is running 24/7!"
+
+def run_web():
+    # Render يمرر المنفذ عبر متغير البيئة PORT
+    port = int(os.environ.get("PORT", 8080))
+    app_web.run(host='0.0.0.0', port=port)
 
 # ================= CONFIG =================
 TOKEN = os.getenv("TOKEN")
@@ -26,13 +41,19 @@ logger = logging.getLogger(__name__)
 
 # ================= DATABASE =================
 def init_db():
-    conn = sqlite3.connect("users.db", check_same_thread=False)
+    conn = sqlite3.connect("bot_data.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY,
         downloads INTEGER DEFAULT 0,
         username TEXT
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS temp_links (
+        id TEXT PRIMARY KEY,
+        url TEXT
     )
     """)
     conn.commit()
@@ -48,11 +69,11 @@ def main_menu_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def download_options_keyboard(url):
+def download_options_keyboard(link_id):
     keyboard = [
         [
-            InlineKeyboardButton("🎬 فيديو (MP4)", callback_data=f"dl_video|{url}"),
-            InlineKeyboardButton("🎵 صوت (MP3)", callback_data=f"dl_audio|{url}")
+            InlineKeyboardButton("🎬 فيديو (MP4)", callback_data=f"dl_video|{link_id}"),
+            InlineKeyboardButton("🎵 صوت (MP3)", callback_data=f"dl_audio|{link_id}")
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -66,34 +87,47 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         f"👋 أهلاً بك يا {user.first_name} في بوت تحميل الفيديوهات الاحترافي! 🚀\n\n"
         "📥 **ماذا يمكنني أن أفعل؟**\n"
-        "أرسل لي رابط أي فيديو من (يوتيوب، تيك توك، إنستغرام، فيسبوك، تويتر) وسأقوم بتحميله لك فوراً بأعلى جودة ممكنة.\n\n"
+        "أرسل لي رابط أي فيديو من (يوتيوب، تيك توك، إنستغرام، فيسبوك، تويتر) وسأقوم بتحميله لك فوراً.\n\n"
         "👇 أرسل الرابط الآن للبدء:"
     )
     await update.message.reply_text(welcome_text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text
-    # التحقق من أن النص هو رابط (بسيط)
-    if re.match(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', url):
+    url = update.message.text.strip()
+    if re.match(r'http[s]?://', url):
+        link_id = str(uuid.uuid4())[:8]
+        cursor.execute("INSERT INTO temp_links (id, url) VALUES (?, ?)", (link_id, url))
+        conn.commit()
+        
         await update.message.reply_text(
             "✅ تم استلام الرابط! اختر الصيغة المطلوبة للتحميل:",
-            reply_markup=download_options_keyboard(url)
+            reply_markup=download_options_keyboard(link_id)
         )
     else:
-        await update.message.reply_text("❌ عذراً، يرجى إرسال رابط فيديو صحيح.")
+        await update.message.reply_text("❌ عذراً، يرجى إرسال رابط فيديو صحيح يبدأ بـ http.")
 
-async def download_task(update: Update, context: ContextTypes.DEFAULT_TYPE, url, mode):
+async def download_task(update: Update, context: ContextTypes.DEFAULT_TYPE, link_id, mode):
     query = update.callback_query
     user_id = query.from_user.id
     
-    status_msg = await query.message.reply_text("⏳ جاري معالجة الفيديو... قد يستغرق ذلك لحظات.")
+    cursor.execute("SELECT url FROM temp_links WHERE id=?", (link_id,))
+    row = cursor.fetchone()
+    if not row:
+        await query.message.reply_text("❌ عذراً، انتهت صلاحية هذا الرابط. يرجى إرساله مرة أخرى.")
+        return
+    
+    url = row[0]
+    status_msg = await query.message.reply_text("⏳ جاري التحميل والمعالجة... يرجى الانتظار.")
 
     try:
-        # إعدادات yt-dlp
+        if not os.path.exists("downloads"):
+            os.makedirs("downloads")
+
+        file_id = str(uuid.uuid4())[:8]
         ydl_opts = {
-            'format': 'bestvideo+bestaudio/best' if mode == 'video' else 'bestaudio/best',
-            'outtmpl': f'downloads/%(id)s_{user_id}.%(ext)s',
-            'max_filesize': 50 * 1024 * 1024, # حد 50 ميجا لتيليجرام بوت العادي
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' if mode == 'video' else 'bestaudio/best',
+            'outtmpl': f'downloads/{file_id}_%(id)s.%(ext)s',
+            'max_filesize': 45 * 1024 * 1024,
             'quiet': True,
             'no_warnings': True,
         }
@@ -110,33 +144,28 @@ async def download_task(update: Update, context: ContextTypes.DEFAULT_TYPE, url,
                 info = ydl.extract_info(url, download=True)
                 return ydl.prepare_filename(info)
 
-        # تشغيل التحميل في thread منفصل لعدم حظر البوت (نصيحة من مهارة telegram-bot-pro)
         file_path = await asyncio.to_thread(download)
         
-        # إذا كان صوت، الامتداد سيتغير لـ mp3 بواسطة postprocessor
         if mode == 'audio':
             file_path = os.path.splitext(file_path)[0] + ".mp3"
 
-        # إرسال الملف
-        await status_msg.edit_text("📤 جاري رفع الملف إلى تيليجرام...")
+        await status_msg.edit_text("📤 جاري الرفع...")
         with open(file_path, 'rb') as f:
             if mode == 'video':
-                await context.bot.send_video(chat_id=user_id, video=f, caption="✅ تم التحميل بنجاح بواسطة بوتك الخرافي!")
+                await context.bot.send_video(chat_id=user_id, video=f, caption="✅ تم التحميل بنجاح!")
             else:
                 await context.bot.send_audio(chat_id=user_id, audio=f, caption="✅ تم تحويل الصوت بنجاح!")
 
-        # تحديث الإحصائيات
         cursor.execute("UPDATE users SET downloads = downloads + 1 WHERE id = ?", (user_id,))
         conn.commit()
 
         await status_msg.delete()
-        # تنظيف الملف بعد الإرسال
         if os.path.exists(file_path):
             os.remove(file_path)
 
     except Exception as e:
-        logger.error(f"Download Error: {e}")
-        await status_msg.edit_text("❌ عذراً، حدث خطأ أثناء التحميل. قد يكون الفيديو طويلاً جداً أو الرابط غير مدعوم.")
+        logger.error(f"Error: {e}")
+        await status_msg.edit_text(f"❌ خطأ: {str(e)[:100]}")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -144,36 +173,28 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if data.startswith("dl_"):
-        mode, url = data.split("|", 1)
-        mode = "video" if "video" in mode else "audio"
-        await download_task(update, context, url, mode)
+        mode_part, link_id = data.split("|")
+        mode = "video" if "video" in mode_part else "audio"
+        await download_task(update, context, link_id, mode)
     
     elif data == "stats":
         cursor.execute("SELECT downloads FROM users WHERE id=?", (query.from_user.id,))
         row = cursor.fetchone()
         count = row[0] if row else 0
-        await query.edit_message_text(f"📊 إحصائياتك:\n\n📥 عدد الفيديوهات المحملة: {count}", reply_markup=main_menu_keyboard())
+        await query.edit_message_text(f"📊 إحصائياتك:\n📥 الفيديوهات المحملة: {count}", reply_markup=main_menu_keyboard())
     
     elif data == "help":
-        help_text = "📖 **كيفية الاستخدام:**\n1. انسخ رابط الفيديو من أي منصة.\n2. أرسل الرابط هنا.\n3. اختر الجودة المطلوبة.\n4. انتظر ثوانٍ وسيصلك الملف!"
-        await query.edit_message_text(help_text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+        await query.edit_message_text("📖 أرسل رابط الفيديو، اختر الجودة، وانتظر التحميل!", reply_markup=main_menu_keyboard())
 
-# ================= MAIN =================
 def main():
-    if not os.path.exists("downloads"):
-        os.makedirs("downloads")
-
-    if not TOKEN:
-        logger.error("TOKEN not found!")
-        return
+    # تشغيل خادم الويب في thread منفصل لـ Render
+    Thread(target=run_web).start()
 
     app = Application.builder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
-
-    logger.info("🚀 بوت التحميل يعمل الآن!")
+    logger.info("🚀 البوت المصلح مع خادم الويب يعمل الآن!")
     app.run_polling()
 
 if __name__ == "__main__":
