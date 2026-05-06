@@ -5,7 +5,7 @@ import sqlite3
 import re
 import uuid
 from threading import Thread
-from flask import Flask, request
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -17,16 +17,19 @@ from telegram.ext import (
 )
 import yt_dlp
 
-# ================= WEB SERVER FOR RENDER =================
+# ================= WEB SERVER FOR RENDER (KEEP-ALIVE) =================
 app_web = Flask(__name__)
 
 @app_web.route('/')
 def home():
-    return "Bot is running 24/7!"
+    return "Bot is running 24/7 with Polling Mode!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app_web.run(host='0.0.0.0', port=port)
 
 # ================= CONFIG =================
 TOKEN = os.getenv("TOKEN")
-RENDER_URL = os.getenv("RENDER_URL")
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -152,7 +155,8 @@ async def download_task(update: Update, context: ContextTypes.DEFAULT_TYPE, link
         conn.commit()
 
         await status_msg.delete()
-        os.remove(file_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -177,36 +181,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "help":
         await query.edit_message_text("📖 أرسل رابط الفيديو فقط.", reply_markup=main_menu_keyboard())
 
-# ================= WEBHOOK =================
-@app_web.route(f"/webhook/{TOKEN}", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True)
-    update = Update.de_json(data, bot_app.bot)
-    bot_app.update_queue.put(update)
-    return "ok"
+def main():
+    # تشغيل خادم الويب في thread منفصل لـ Render
+    Thread(target=run_web).start()
 
-# ================= START BOT =================
-async def run_bot():
-    global bot_app
-    bot_app = Application.builder().token(TOKEN).build()
-
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    bot_app.add_handler(CallbackQueryHandler(button_callback))
-
-    webhook_url = f"{RENDER_URL}/webhook/{TOKEN}"
-    await bot_app.bot.set_webhook(webhook_url)
-
-    logger.info(f"🚀 Webhook set: {webhook_url}")
-
-    await bot_app.initialize()
-    await bot_app.start()
-    await bot_app.updater.start_polling()
-
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app_web.run(host='0.0.0.0', port=port)
+    # بناء التطبيق واستخدام Polling
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    
+    logger.info("🚀 البوت يعمل بنظام Polling المستقر!")
+    # drop_pending_updates=True يحل مشكلة التضارب مع أي Webhook قديم
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    Thread(target=run_web).start()
-    asyncio.run(run_bot())
+    main()
