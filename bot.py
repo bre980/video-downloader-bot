@@ -5,7 +5,7 @@ import sqlite3
 import re
 import uuid
 from threading import Thread
-from flask import Flask
+from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -17,21 +17,16 @@ from telegram.ext import (
 )
 import yt_dlp
 
-# ================= WEB SERVER FOR RENDER (KEEP-ALIVE) =================
+# ================= WEB SERVER FOR RENDER =================
 app_web = Flask(__name__)
 
 @app_web.route('/')
 def home():
     return "Bot is running 24/7!"
 
-def run_web():
-    # Render يمرر المنفذ عبر متغير البيئة PORT
-    port = int(os.environ.get("PORT", 8080))
-    app_web.run(host='0.0.0.0', port=port)
-
 # ================= CONFIG =================
 TOKEN = os.getenv("TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")
+RENDER_URL = os.getenv("RENDER_URL")
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -86,9 +81,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"👋 أهلاً بك يا {user.first_name} في بوت تحميل الفيديوهات الاحترافي! 🚀\n\n"
-        "📥 **ماذا يمكنني أن أفعل؟**\n"
-        "أرسل لي رابط أي فيديو من (يوتيوب، تيك توك، إنستغرام، فيسبوك، تويتر) وسأقوم بتحميله لك فوراً.\n\n"
-        "👇 أرسل الرابط الآن للبدء:"
+        "📥 **أرسل رابط أي فيديو وسأقوم بتحميله لك فوراً.**"
     )
     await update.message.reply_text(welcome_text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
 
@@ -100,11 +93,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         
         await update.message.reply_text(
-            "✅ تم استلام الرابط! اختر الصيغة المطلوبة للتحميل:",
+            "✅ تم استلام الرابط! اختر الصيغة المطلوبة:",
             reply_markup=download_options_keyboard(link_id)
         )
     else:
-        await update.message.reply_text("❌ عذراً، يرجى إرسال رابط فيديو صحيح يبدأ بـ http.")
+        await update.message.reply_text("❌ يرجى إرسال رابط فيديو صحيح يبدأ بـ http.")
 
 async def download_task(update: Update, context: ContextTypes.DEFAULT_TYPE, link_id, mode):
     query = update.callback_query
@@ -113,11 +106,11 @@ async def download_task(update: Update, context: ContextTypes.DEFAULT_TYPE, link
     cursor.execute("SELECT url FROM temp_links WHERE id=?", (link_id,))
     row = cursor.fetchone()
     if not row:
-        await query.message.reply_text("❌ عذراً، انتهت صلاحية هذا الرابط. يرجى إرساله مرة أخرى.")
+        await query.message.reply_text("❌ انتهت صلاحية الرابط. أعد الإرسال.")
         return
     
     url = row[0]
-    status_msg = await query.message.reply_text("⏳ جاري التحميل والمعالجة... يرجى الانتظار.")
+    status_msg = await query.message.reply_text("⏳ جاري التحميل...")
 
     try:
         if not os.path.exists("downloads"):
@@ -125,11 +118,10 @@ async def download_task(update: Update, context: ContextTypes.DEFAULT_TYPE, link
 
         file_id = str(uuid.uuid4())[:8]
         ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' if mode == 'video' else 'bestaudio/best',
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best' if mode == 'video' else 'bestaudio/best',
             'outtmpl': f'downloads/{file_id}_%(id)s.%(ext)s',
             'max_filesize': 45 * 1024 * 1024,
             'quiet': True,
-            'no_warnings': True,
         }
         
         if mode == 'audio':
@@ -152,16 +144,15 @@ async def download_task(update: Update, context: ContextTypes.DEFAULT_TYPE, link
         await status_msg.edit_text("📤 جاري الرفع...")
         with open(file_path, 'rb') as f:
             if mode == 'video':
-                await context.bot.send_video(chat_id=user_id, video=f, caption="✅ تم التحميل بنجاح!")
+                await context.bot.send_video(chat_id=user_id, video=f, caption="✅ تم التحميل!")
             else:
-                await context.bot.send_audio(chat_id=user_id, audio=f, caption="✅ تم تحويل الصوت بنجاح!")
+                await context.bot.send_audio(chat_id=user_id, audio=f, caption="🎵 تم التحويل!")
 
         cursor.execute("UPDATE users SET downloads = downloads + 1 WHERE id = ?", (user_id,))
         conn.commit()
 
         await status_msg.delete()
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        os.remove(file_path)
 
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -181,21 +172,41 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("SELECT downloads FROM users WHERE id=?", (query.from_user.id,))
         row = cursor.fetchone()
         count = row[0] if row else 0
-        await query.edit_message_text(f"📊 إحصائياتك:\n📥 الفيديوهات المحملة: {count}", reply_markup=main_menu_keyboard())
+        await query.edit_message_text(f"📊 إحصائياتك:\n📥 عدد التحميلات: {count}", reply_markup=main_menu_keyboard())
     
     elif data == "help":
-        await query.edit_message_text("📖 أرسل رابط الفيديو، اختر الجودة، وانتظر التحميل!", reply_markup=main_menu_keyboard())
+        await query.edit_message_text("📖 أرسل رابط الفيديو فقط.", reply_markup=main_menu_keyboard())
 
-def main():
-    # تشغيل خادم الويب في thread منفصل لـ Render
-    Thread(target=run_web).start()
+# ================= WEBHOOK =================
+@app_web.route(f"/webhook/{TOKEN}", methods=["POST"])
+def webhook():
+    data = request.get_json(force=True)
+    update = Update.de_json(data, bot_app.bot)
+    bot_app.update_queue.put(update)
+    return "ok"
 
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    logger.info("🚀 البوت المصلح مع خادم الويب يعمل الآن!")
-    app.run_polling()
+# ================= START BOT =================
+async def run_bot():
+    global bot_app
+    bot_app = Application.builder().token(TOKEN).build()
+
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    bot_app.add_handler(CallbackQueryHandler(button_callback))
+
+    webhook_url = f"{RENDER_URL}/webhook/{TOKEN}"
+    await bot_app.bot.set_webhook(webhook_url)
+
+    logger.info(f"🚀 Webhook set: {webhook_url}")
+
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling()
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app_web.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
-    main()
+    Thread(target=run_web).start()
+    asyncio.run(run_bot())
