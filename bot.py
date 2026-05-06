@@ -15,6 +15,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+from telegram.error import BadRequest
 import yt_dlp
 
 # ================= WEB SERVER FOR RENDER (KEEP-ALIVE) =================
@@ -22,7 +23,7 @@ app_web = Flask(__name__)
 
 @app_web.route('/')
 def home():
-    return "Bot is running 24/7 with Polling Mode!"
+    return "Bot is running 24/7 with Mandatory Subscription!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -30,6 +31,8 @@ def run_web():
 
 # ================= CONFIG =================
 TOKEN = os.getenv("TOKEN")
+CHANNEL_ID = "@bre766202"  # معرف القناة للاشتراك الإجباري
+CHANNEL_URL = "https://t.me/bre766202"
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -59,6 +62,28 @@ def init_db():
 
 conn, cursor = init_db()
 
+# ================= UTILS =================
+async def is_subscribed(user_id, context):
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        if member.status in ['member', 'administrator', 'creator']:
+            return True
+        return False
+    except BadRequest:
+        # في حال لم يتم إضافة البوت كمسؤول في القناة
+        logger.warning(f"البوت ليس مسؤولاً في القناة {CHANNEL_ID}")
+        return True # السماح بالمرور لتجنب تعطل البوت
+    except Exception as e:
+        logger.error(f"Error checking subscription: {e}")
+        return True
+
+def subscription_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📢 انضم للقناة الآن", url=CHANNEL_URL)],
+        [InlineKeyboardButton("✅ تم الاشتراك", callback_data="check_sub")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 # ================= KEYBOARDS =================
 def main_menu_keyboard():
     keyboard = [
@@ -79,6 +104,17 @@ def download_options_keyboard(link_id):
 # ================= HANDLERS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    user_id = user.id
+    
+    # التحقق من الاشتراك
+    if not await is_subscribed(user_id, context):
+        await update.message.reply_text(
+            f"⚠️ عذراً يا {user.first_name}، يجب عليك الاشتراك في قناتنا أولاً لاستخدام البوت!\n\n"
+            "اشترك ثم اضغط على زر 'تم الاشتراك' بالأسفل 👇",
+            reply_markup=subscription_keyboard()
+        )
+        return
+
     cursor.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (user.id, user.username))
     conn.commit()
 
@@ -89,6 +125,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # التحقق من الاشتراك قبل معالجة أي رابط
+    if not await is_subscribed(user_id, context):
+        await update.message.reply_text(
+            "⚠️ يجب عليك الاشتراك في القناة أولاً لاستخدام ميزات التحميل!",
+            reply_markup=subscription_keyboard()
+        )
+        return
+
     url = update.message.text.strip()
     if re.match(r'http[s]?://', url):
         link_id = str(uuid.uuid4())[:8]
@@ -165,15 +211,30 @@ async def download_task(update: Update, context: ContextTypes.DEFAULT_TYPE, link
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
+    user_id = query.from_user.id
     await query.answer()
 
-    if data.startswith("dl_"):
+    if data == "check_sub":
+        if await is_subscribed(user_id, context):
+            await query.message.edit_text(
+                "✅ شكراً لاشتراكك! يمكنك الآن استخدام البوت.\nأرسل رابط الفيديو للبدء:",
+                reply_markup=main_menu_keyboard()
+            )
+        else:
+            await query.answer("❌ لم تشترك في القناة بعد!", show_alert=True)
+
+    elif data.startswith("dl_"):
+        # التحقق من الاشتراك حتى عند الضغط على أزرار التحميل
+        if not await is_subscribed(user_id, context):
+            await query.message.reply_text("⚠️ يجب عليك الاشتراك في القناة أولاً!", reply_markup=subscription_keyboard())
+            return
+            
         mode_part, link_id = data.split("|")
         mode = "video" if "video" in mode_part else "audio"
         await download_task(update, context, link_id, mode)
     
     elif data == "stats":
-        cursor.execute("SELECT downloads FROM users WHERE id=?", (query.from_user.id,))
+        cursor.execute("SELECT downloads FROM users WHERE id=?", (user_id,))
         row = cursor.fetchone()
         count = row[0] if row else 0
         await query.edit_message_text(f"📊 إحصائياتك:\n📥 عدد التحميلات: {count}", reply_markup=main_menu_keyboard())
@@ -182,17 +243,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📖 أرسل رابط الفيديو فقط.", reply_markup=main_menu_keyboard())
 
 def main():
-    # تشغيل خادم الويب في thread منفصل لـ Render
     Thread(target=run_web).start()
 
-    # بناء التطبيق واستخدام Polling
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     
-    logger.info("🚀 البوت يعمل بنظام Polling المستقر!")
-    # drop_pending_updates=True يحل مشكلة التضارب مع أي Webhook قديم
+    logger.info("🚀 البوت مع الاشتراك الإجباري يعمل الآن!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
